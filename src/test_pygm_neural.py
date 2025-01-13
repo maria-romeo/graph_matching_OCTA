@@ -1,0 +1,230 @@
+import wandb
+from torch.utils.data import DataLoader
+from datasets.graph_matching_dataset import GraphMatchingDataset
+import os
+import pygmtools as pygm
+import torch
+from tools.calculate_metrics import calculate_metrics
+import pandas as pd
+import sys
+from sklearn.model_selection import train_test_split
+from collections import defaultdict
+from torch.utils.data import Subset
+from tools.train_neural_models import train, validate, evaluate
+current_dir = os.getcwd()
+sys.path.append(os.path.join(current_dir, '..'))
+from visualization_tools.vvg_loader import vvg_to_df
+
+
+valid_feats1 = ['length', 'distance', 'curveness', 'volume', 'avgCrossSection', 'minRadiusAvg', 'avgRadiusAvg', 'roundnessAvg']
+valid_feats2 = ['length', 'distance', 'volume', 'avgCrossSection', 'avgRadiusAvg']
+
+## WANDB ##
+# Define sweep config
+sweep_configuration = {
+    "method": "grid",
+    "name": "sweep",
+    "metric": {"goal": "maximize", "name": "best_acc"},
+    "parameters": {
+        "model": {"values": ['ngm']}, # 'ipca_gm', 'pca_gm', 'ngm', 'cie'
+        "dataset": {"values": ['soul_big']}, # 'soul'
+        "valid_feats": {"values": [valid_feats2]},#,valid_feats2,['avgCrossSection', 'avgRadiusAvg']]},#,['length'], ['distance'], ['curveness'], ['volume'], ['avgCrossSection'], ['minRadiusAvg'], ['avgRadiusAvg'], ['roundnessAvg']},
+        "epochs": {"values": [20]},
+        "lr": {"values": [1e-4]},
+        "momentum": {"values": [0.9]},
+        "weight_decay": {"values": [1e-4]}, #1e-6, 1e-4
+        "optimizer": {"values": ['adamW']},#,, 'sgd']},
+        
+    },
+}
+
+sweep_id = wandb.sweep(sweep=sweep_configuration, project="GM_test")
+
+
+i = 0
+def main():
+    global i 
+    i +=1
+    run = wandb.init()
+    name = f"{i}_{wandb.config.model}_dataset{wandb.config.dataset}_lr{wandb.config.lr}"
+    wandb.run.name = name
+    api = wandb.Api()
+    sweep = api.sweep("ge92lik/GM_test/" + sweep_id)
+
+    # Set the device to GPU if available, otherwise CPU
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Print GPU information at the beginning
+    if torch.cuda.is_available():
+        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        print("No GPU available, using CPU.")
+
+    if wandb.config.dataset == 'soul':
+        dataset_name = 'soul_dataset'
+    elif wandb.config.dataset == 'soul_big':
+        dataset_name = 'soul_dataset_big'
+    src_dir = f'../data/{dataset_name}/'
+    transforms_dir = os.path.join(src_dir, 'transformed_images')
+
+    # Initialize the dataset
+    dataset = GraphMatchingDataset(src_dir=src_dir, 
+                                valid_feats=wandb.config.valid_feats, 
+                                transforms_dir=transforms_dir)
+    
+    # Group images by subject
+    subject_to_images = defaultdict(list)
+    for index in dataset.indexes:
+        subject = index.split('_')[0]  # Extract the subject number
+        subject_to_images[subject].append(index)
+
+    # Convert grouped data to a list of subject groups for splitting
+    subject_groups = list(subject_to_images.values())
+
+    train_subjects, tmp_subjects = train_test_split(subject_groups, test_size=0.40, random_state=42)
+    val_subjects, test_subjects = train_test_split(tmp_subjects, test_size=0.50, random_state=42)
+
+    # Flatten lists of images per split
+    train_idxs = [img for subject in train_subjects for img in subject]
+    val_idxs = [img for subject in val_subjects for img in subject]
+    test_idxs = [img for subject in test_subjects for img in subject]
+
+    # Convert the indexes back to actual dataset indices
+    train_set = Subset(dataset, [dataset.indexes.index(idx) for idx in train_idxs])
+    val_set = Subset(dataset, [dataset.indexes.index(idx) for idx in val_idxs])
+    test_set = Subset(dataset, [dataset.indexes.index(idx) for idx in test_idxs])
+
+    # Create DataLoaders for each set
+    train_loader = DataLoader(train_set, batch_size=1, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=1, shuffle=False)
+    test_loader = DataLoader(test_set, batch_size=1, shuffle=False)
+
+
+    pygm.set_backend('pytorch')
+
+
+    # Create the network using pygmtools' get_network
+    if wandb.config.model == 'ipca_gm':
+        net = pygm.utils.get_network(pygm.ipca_gm, pretrain='voc').to(device)
+    elif wandb.config.model == 'pca_gm':
+        net = pygm.utils.get_network(pygm.pca_gm, pretrain='voc').to(device)
+    elif wandb.config.model == 'ngm':
+        net = pygm.utils.get_network(pygm.ngm, pretrain='voc').to(device)
+    elif wandb.config.model == 'cie':
+        net = pygm.utils.get_network(pygm.cie, pretrain='voc').to(device)
+    
+    for param in net.parameters():
+        param.requires_grad = True
+
+
+    # Set up an optimizer (SGD is used here as in the example, but you could use Adam or others)
+    optimizer_dict = {"adamW": torch.optim.AdamW(net.parameters(), lr=wandb.config.lr, weight_decay=wandb.config.weight_decay),
+                        "sgd": torch.optim.SGD(net.parameters(), lr=wandb.config.lr, momentum=wandb.config.momentum, weight_decay=wandb.config.weight_decay)}
+
+    optimizer = optimizer_dict[wandb.config.optimizer]
+
+    # Store best accuracy
+    best_acc = 0
+
+    # Store the evaluation metrics for every sample
+    records = []
+    # Create dirs to store results
+    if not os.path.exists('GM_results'):
+        os.makedirs('GM_results')
+    if not os.path.exists(f'GM_results/pygm_neural/{wandb.config.model}_matrix_results'):
+        os.makedirs(f'GM_results/pygm_neural/{wandb.config.model}_matrix_results')
+    x_pred_dir = f'GM_results/pygm_neural/{wandb.config.model}_matrix_results'
+
+    for epoch in range(wandb.config.epochs):
+        
+        # train
+        net, avg_loss, acc, prec, recall, f1 = train(train_loader, net.to(device), wandb.config.model, optimizer, device)
+
+        mean_acc = torch.tensor(acc).mean()
+        mean_prec = torch.tensor(prec).mean()
+        mean_recall = torch.tensor(recall).mean()
+        mean_f1 = torch.tensor(f1).mean()
+        std_acc = torch.tensor(acc).std()
+        std_prec = torch.tensor(prec).std()
+        std_recall = torch.tensor(recall).std()
+        std_f1 = torch.tensor(f1).std()
+
+        # Print average loss for this epoch
+        print(f'Epoch {epoch+1}/{wandb.config.epochs}, Loss: {avg_loss}, Acc: {mean_acc}, Prec: {mean_prec}, Recall: {mean_recall}, F1: {mean_f1}')
+
+        # validate
+        net, avg_val_loss, val_acc, val_prec, val_recall, val_f1 = validate(val_loader, net.to(device), wandb.config.model, device)
+
+        mean_val_acc = torch.tensor(val_acc).mean()
+        mean_val_prec = torch.tensor(val_prec).mean()
+        mean_val_recall = torch.tensor(val_recall).mean()
+        mean_val_f1 = torch.tensor(val_f1).mean()
+        std_val_acc = torch.tensor(val_acc).std()   
+        std_val_prec = torch.tensor(val_prec).std()
+        std_val_recall = torch.tensor(val_recall).std()
+        std_val_f1 = torch.tensor(val_f1).std()
+
+        if mean_val_acc > best_acc:
+            best_acc = mean_val_acc
+            best_model_path = f'GM_results/pygm_neural/{wandb.config.model}_best_model.pth'
+            torch.save(net.state_dict(), best_model_path)
+
+        wandb.log({"loss": avg_loss,
+                   " best val acc": best_acc,
+                    "train_acc": mean_acc, "train_acc_std": std_acc,
+                    "train_prec": mean_prec, "train_prec_std": std_prec,
+                    "train_recall": mean_recall, "train_recall_std": std_recall,
+                    "train_f1": mean_f1, "train_f1_std": std_f1,
+                    "val_loss": avg_val_loss,
+                    "val_acc": mean_val_acc, "val_acc_std": std_val_acc,
+                    "val_prec": mean_val_prec, "val_prec_std": std_val_prec,
+                    "val_recall": mean_val_recall, "val_recall_std": std_val_recall,
+                    "val_f1": mean_val_f1, "val_f1_std": std_val_f1
+        })
+    
+    # Load the best model for evaluation
+    net.load_state_dict(torch.load(best_model_path))
+    net.to(device)
+
+    # Evaluate the model on the test set
+    output_dir = 'GM_results'
+    net, avg_test_loss, test_acc, test_prec, test_recall, test_f1 = evaluate(test_loader, net.to(device), wandb.config.model, device, output_dir)
+
+    mean_test_acc = torch.tensor(test_acc).mean()
+    mean_test_prec = torch.tensor(test_prec).mean()
+    mean_test_recall = torch.tensor(test_recall).mean()
+    mean_test_f1 = torch.tensor(test_f1).mean()
+    std_test_acc = torch.tensor(test_acc).std()
+    std_test_prec = torch.tensor(test_prec).std()
+    std_test_recall = torch.tensor(test_recall).std()
+    std_test_f1 = torch.tensor(test_f1).std()
+
+    # Log final test results to wandb
+    wandb.log({
+        "test_acc": mean_test_acc, "test_acc_std": std_test_acc,
+        "test_prec": mean_test_prec, "test_prec_std": std_test_prec,
+        "test_recall": mean_test_recall, "test_recall_std": std_test_recall,
+        "test_f1": mean_test_f1, "test_f1_std": std_test_f1
+    })
+    
+    # SAVE METRICS AND MODEL CONFIG
+    # Save the model configuration
+    # Write model and features to a text file
+    with open(f'GM_results/pygm_neural/{wandb.config.model}_config_info.txt', 'a') as config_file:
+        config_file.write(f"Model: {wandb.config.model}\n")
+        config_file.write(f"Dataset: {dataset}\n")
+        config_file.write(f"Features: {wandb.config.valid_feats}\n")
+        config_file.write(f"Learing Rate: {wandb.config.lr}\n")
+        config_file.write(f"Momentum: {wandb.config.momentum}\n")
+        config_file.write(f"Weight Decay: {wandb.config.weight_decay}\n")
+        config_file.write(f"Optimizer: {wandb.config.optimizer}\n")
+        config_file.write("\n")
+
+    # Save the evaluation metrics
+    with open(f'GM_results/pygm_neural/{wandb.config.model}_avge_evaluation_metrics.txt', 'a') as metrics_file:
+        metrics_file.write(f"Mean Test Accuracy: {mean_test_acc}, Mean Test Precision: {mean_test_prec}, Mean Test Recall: {mean_test_recall}, Mean Test F1 Score: {mean_test_f1}\n")
+        metrics_file.write(f"Std Test Accuracy: {std_test_acc}, Std Test Precision: {std_test_prec}, Std Test Recall: {std_test_recall}, Std Test F1 Score: {std_test_f1}\n")
+        metrics_file.write("\n")
+
+
+wandb.agent(sweep_id, function=main, count=1)
